@@ -47,7 +47,7 @@ def decide(market_state, portfolio_state, cash) -> list[dict]:
 | Trade rate | ≤ 50 trades/day | Excess rejected |
 | Min hold | ≥ 60s | Excess rejected |
 | Decide() runtime | ≤ 5s per call | Tick errors out (you keep going) |
-| LLM cost (if used) | ≤ 5 GB-hours/month | Proxy kills connection |
+| LLM use (optional) | **Bring your own API key** | Your AI spend is yours; keeps the contest about ideas, not API budget |
 
 ## Rules of engagement — external data & network
 
