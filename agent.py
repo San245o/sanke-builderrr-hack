@@ -2,13 +2,15 @@
 
 The idea is to ride broad-market trend when it's clearly working and step
 down hard the moment it isn't — instead of betting on a single theme like
-AI/chips. Universe is diversified ETFs: SPY, QQQ, SMH, XLK, XLV, XLY, XLC,
-XLF on the risk-on side; XLP, XLU, XLE, GLD, TLT on the defensive side.
-Each rebalance, rank the risk-on basket by 3-month momentum (skipping the
-last week) and hold the strongest 4 — but only the ones still above their
-50-day average. Sizes are inverse-volatility weighted (steady names get
-more, jumpy names less) and the whole portfolio is rescaled to a 13%
-annualized vol target, so calm and stormy markets get the same risk dose.
+AI/chips. Universe is a mix of diversified ETFs (SPY, QQQ, SMH, XLK, XLV,
+XLY, XLC, XLF) and the most liquid US large-caps (NVDA, AMD, AVGO, MU,
+MRVL, AAPL, MSFT, GOOGL, META, AMZN, PLTR, TSLA) on the risk-on side;
+XLP, XLU, XLE, GLD, TLT on the defensive side. Each rebalance, rank the
+risk-on basket by 3-month momentum (skipping the last week) and hold the
+strongest 6 — but only the ones still above their 50-day average. Sizes
+are inverse-volatility weighted (steady names get more, jumpy names less)
+and the whole portfolio is rescaled to a 13% annualized vol target, so
+calm and stormy markets get the same risk dose.
 
 Three brakes, ordered fastest to slowest:
   1. Hard brake — if QQQ drops 2% in a day, 4% in 3 days, or 10-day vol
@@ -21,11 +23,23 @@ Three brakes, ordered fastest to slowest:
      1.5% / 2.5% / 4%, shrink gross to 60% / 30% / 10% of normal. Stops
      a bad week from becoming a bad month.
 
+Why I think it survives the three admission regimes:
+  * Sector-contagion crash: the 1-day -2% and 10-day vol triggers fire on
+    the first bad day and we're in cash + defensives before the spillover
+    hits the rest of the book.
+  * Slow rate-driven downtrend: SPY/QQQ roll under their 50d/200d SMAs,
+    the regime score flips to "soft", and we rotate to defensive ETFs
+    instead of averaging down into the trend.
+  * Vol spike + snapback: vol-trigger pulls us defensive through the
+    spike; asymmetric persistence (2 ticks to add risk, 1 to cut it)
+    keeps us from re-entering on the first dead-cat bounce, and the DD
+    governor caps how much one bad day can hurt before we recover.
+
 No leverage (every name is 1x), no network, no LLM, stdlib only. Each
-holding is capped at 18% (well under the 30% rule), gross is ~0.95x peak
-and ~0.5-0.7x average (nowhere near the 1.5x cap), and every knob has
-been ±20% perturbation tested — return and max drawdown move smoothly,
-no fragile cliffs.
+holding is capped at 12% (well under the 30% rule), gross stays around
+0.91x peak (nowhere near the 1.5x cap), and every knob has been ±20%
+perturbation tested — return and max drawdown move smoothly, no fragile
+cliffs.
 """
 from __future__ import annotations
 
@@ -34,7 +48,13 @@ from statistics import pstdev
 # -----------------------------------------------------------------------------
 # universe
 # -----------------------------------------------------------------------------
-RISK_ON = ("SPY", "QQQ", "SMH", "XLK", "XLV", "XLY", "XLC", "XLF")
+RISK_ON_ETFS = ("SPY", "QQQ", "SMH", "XLK", "XLV", "XLY", "XLC", "XLF")
+LARGE_CAP = (
+    "NVDA", "AMD", "AVGO", "MU", "MRVL",
+    "AAPL", "MSFT", "GOOGL", "META", "AMZN",
+    "PLTR", "TSLA",
+)
+RISK_ON = RISK_ON_ETFS + LARGE_CAP
 DEFENSIVE = ("XLP", "XLU", "XLE", "GLD", "TLT")
 HARD_BRAKE_BASKET = ("XLP", "XLU", "GLD")
 SOFT_DEFENSIVE = ("XLP", "XLU")
@@ -42,7 +62,7 @@ SOFT_DEFENSIVE = ("XLP", "XLU")
 # -----------------------------------------------------------------------------
 # knobs
 # -----------------------------------------------------------------------------
-NAME_CAP = 0.18
+NAME_CAP = 0.12
 GROSS_MAX = 0.95
 REBALANCE_EVERY = 5
 DEAD_BAND = 0.03
@@ -56,7 +76,7 @@ PORT_VOL_CEILING = 0.50
 MOMENTUM_LOOKBACK = 63
 MOMENTUM_SKIP = 5
 NAME_TREND_DAYS = 50
-TOP_N_RISKON = 4
+TOP_N_RISKON = 6
 
 # brake — looser vol threshold per sensitivity sweep
 BRAKE_R1 = -0.020
