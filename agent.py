@@ -1,11 +1,8 @@
-"""Calmar Defense Plus candidate agent.
+"""Calmar Warming candidate agent.
 
-This is a conservative Calmar-first variant. It keeps Previous implementation's most useful
-ideas: slow risk-on confirmation, fast risk-off cuts, low concentration,
-inverse-vol sizing, and a self-drawdown governor. The main difference is the
-soft/risk-off book: instead of forcing GLD/TLT-heavy defensives or mostly cash,
-it rotates through lower-volatility sector leadership with a tiny stabilizer
-sleeve.
+Extends calmar_defense_plus with a "warming" regime between soft defensive
+and full risk-on. Warming blends defensive sectors with broad beta during
+recovery phases to capture rebound P&L without sacrificing Calmar.
 
 No network, no LLM, no third-party dependencies.
 """
@@ -23,19 +20,22 @@ DEFENSIVE_CORE = ("XLP", "XLV", "XLRE", "XLF", "XLE", "XLU")
 HARD_CORE = ("XLP", "XLV", "XLRE", "XLU")
 STABILITY_SLEEVE = ("LMT", "RTX", "NOC")
 RATE_HEDGES = ("TLT", "GLD")
+WARMING_BASKET = ("SPY", "QQQ", "XLK", "SMH", "XLV", "XLP", "XLRE",
+                   "NVDA", "AAPL", "MSFT")
 
-NAME_CAP = 0.125
-DEF_CAP = 0.115
+NAME_CAP = 0.25
+DEF_CAP = 0.14
 STABILITY_CAP = 0.035
-GROSS_MAX = 0.94
-SOFT_GROSS = 0.52
-HARD_GROSS = 0.28
+GROSS_MAX = 1.00
+SOFT_GROSS = 0.60
+HARD_GROSS = 0.32
 PANIC_GROSS = 0.30
-REBALANCE_EVERY = 5
+WARMING_GROSS = 0.80
+REBALANCE_EVERY = 4
 DEAD_BAND = 0.018
 
 VOL_LOOKBACK = 20
-TARGET_VOL = 0.13
+TARGET_VOL = 0.18
 PORT_VOL_FLOOR = 0.06
 PORT_VOL_CEILING = 0.45
 
@@ -43,7 +43,7 @@ MOM_LONG = 63
 MOM_SHORT = 20
 MOM_SKIP = 5
 TREND = 50
-TOP_N = 7
+TOP_N = 5
 
 BRAKE_R1 = -0.020
 BRAKE_R3 = -0.042
@@ -58,7 +58,8 @@ DD3 = 0.055
 
 _ANN = 252 ** 0.5
 _tick = 0
-_last_rebalance = -10**9
+_last_rebalance = -10 ** 9
+_last_regime = None
 _brake_cooldown = 0
 _peak_equity = 0.0
 _pending_regime = None
@@ -139,13 +140,13 @@ def _raw_regime(market_state):
     qqq = _closes(market_state.get("QQQ") or [])
     if len(spy) < 60 or len(qqq) < 60:
         return "soft"
- 
+
     r1 = _ret(qqq, 1)
     r3 = _ret(qqq, 3)
     v10 = _vol(qqq, 10)
     if (r1 is not None and r1 < BRAKE_R1) or (r3 is not None and r3 < BRAKE_R3) or (v10 is not None and v10 > BRAKE_VOL_10D):
         return "hard"
-    
+
     spy_6m = _ret(spy, 126)
     spy_v20 = _vol(spy, 20)
     if spy_6m is not None and spy_v20 is not None and spy_6m < PANIC_RET and spy_v20 > PANIC_VOL:
@@ -155,10 +156,21 @@ def _raw_regime(market_state):
     qqq_50 = _sma(qqq, TREND)
     spy_200 = _sma(spy, 200)
     qqq_v20 = _vol(qqq, 20)
-    if spy_50 is None or qqq_50 is None or qqq_v20 is None:
-        return "soft"
-    if spy[-1] > spy_50 * 1.004 and qqq[-1] > qqq_50 * 1.004 and qqq_v20 < 0.35 and (spy_200 is None or spy[-1] > spy_200):
+
+    if (spy_50 is not None and qqq_50 is not None and qqq_v20 is not None
+            and spy[-1] > spy_50 * 1.004 and qqq[-1] > qqq_50 * 1.004
+            and qqq_v20 < 0.35 and (spy_200 is None or spy[-1] > spy_200)):
         return "on"
+
+    spy_10 = _sma(spy, 10)
+    qqq_10 = _sma(qqq, 10)
+    qqq_3d = _ret(qqq, 3)
+    if (spy_10 is not None and qqq_10 is not None
+            and spy[-1] > spy_10 and qqq[-1] > qqq_10
+            and qqq_3d is not None and qqq_3d >= -0.01
+            and qqq_v20 is not None and qqq_v20 < 0.45):
+        return "warming"
+
     return "soft"
 
 
@@ -173,7 +185,7 @@ def _confirm_regime(raw):
         _pending_regime = None
         _pending_count = 0
         return _current_regime
-    confirm = 1 if _current_regime == "on" else 2
+    confirm = 1 if _current_regime in ("on", "warming") else 2
     if raw == _pending_regime:
         _pending_count += 1
     else:
@@ -299,8 +311,8 @@ def _targets(market_state, equity, regime):
         core = _make_weights(_score(market_state, HARD_CORE, defensive=True), HARD_GROSS, DEF_CAP, 4)
         return _finalize(core, HARD_GROSS * dd, market_state)
 
-    if regime in ("soft", "panic"):
-        cap = PANIC_GROSS if regime == "panic" else SOFT_GROSS
+    if regime == "panic":
+        cap = PANIC_GROSS
         targets = _make_weights(_score(market_state, DEFENSIVE_CORE, defensive=True), cap * 0.82, DEF_CAP, 5)
         stabilizers = _make_weights(_score(market_state, STABILITY_SLEEVE, defensive=True), 1.0, STABILITY_CAP, 2)
         hedges = _make_weights(_score(market_state, RATE_HEDGES, defensive=True), 1.0, DEF_CAP, 1)
@@ -308,15 +320,36 @@ def _targets(market_state, equity, regime):
         _add_sleeve(targets, hedges, cap * 0.08)
         return _finalize(targets, cap * dd, market_state)
 
-    risk = _make_weights(_score(market_state, RISK_ON), 0.80, NAME_CAP, TOP_N)
+    if regime == "soft":
+        cap = SOFT_GROSS
+        targets = _make_weights(_score(market_state, DEFENSIVE_CORE, defensive=True), cap * 0.85, DEF_CAP, 5)
+        stabilizers = _make_weights(_score(market_state, STABILITY_SLEEVE, defensive=True), 1.0, STABILITY_CAP, 2)
+        hedges = _make_weights(_score(market_state, RATE_HEDGES, defensive=True), 1.0, DEF_CAP, 1)
+        _add_sleeve(targets, stabilizers, cap * 0.09)
+        _add_sleeve(targets, hedges, cap * 0.06)
+        return _finalize(targets, cap * dd, market_state)
+
+    if regime == "warming":
+        risk = _make_weights(_score(market_state, WARMING_BASKET), 0.90, NAME_CAP, 6)
+        if not risk:
+            core = _make_weights(_score(market_state, DEFENSIVE_CORE, defensive=True), 0.40, DEF_CAP, 4)
+            return _finalize(core, 0.40 * dd, market_state)
+        core = _make_weights(_score(market_state, DEFENSIVE_CORE, defensive=True), 1.0, DEF_CAP, 2)
+        stabilizers = _make_weights(_score(market_state, STABILITY_SLEEVE, defensive=True), 1.0, STABILITY_CAP, 1)
+        targets = dict(risk)
+        _add_sleeve(targets, core, 0.06)
+        _add_sleeve(targets, stabilizers, 0.02)
+        return _finalize(targets, WARMING_GROSS * dd, market_state)
+
+    risk = _make_weights(_score(market_state, RISK_ON), 0.98, NAME_CAP, TOP_N)
     if not risk:
-        core = _make_weights(_score(market_state, DEFENSIVE_CORE, defensive=True), 0.30, DEF_CAP, 4)
-        return _finalize(core, 0.30 * dd, market_state)
+        core = _make_weights(_score(market_state, DEFENSIVE_CORE, defensive=True), 0.40, DEF_CAP, 4)
+        return _finalize(core, 0.40 * dd, market_state)
     core = _make_weights(_score(market_state, DEFENSIVE_CORE, defensive=True), 1.0, DEF_CAP, 2)
     stabilizers = _make_weights(_score(market_state, STABILITY_SLEEVE, defensive=True), 1.0, STABILITY_CAP, 1)
     targets = dict(risk)
-    _add_sleeve(targets, core, 0.08)
-    _add_sleeve(targets, stabilizers, 0.025)
+    _add_sleeve(targets, core, 0.05)
+    _add_sleeve(targets, stabilizers, 0.015)
     return _finalize(targets, GROSS_MAX * dd, market_state)
 
 
@@ -364,14 +397,16 @@ def _orders(targets, positions, market_state, equity, cash):
 
 
 def decide(market_state, portfolio_state, cash):
-    global _tick, _last_rebalance
+    global _tick, _last_rebalance, _last_regime
     _tick += 1
     equity = _equity(portfolio_state, cash)
     if equity <= 0:
         return []
     regime = _confirm_regime(_raw_regime(market_state))
     urgent = regime in ("hard", "panic") or _brake_cooldown > 0
-    if not urgent and _tick - _last_rebalance < REBALANCE_EVERY:
+    risk_off = _last_regime in ("on", "warming") and regime in ("soft", "hard", "panic")
+    _last_regime = regime
+    if not urgent and not risk_off and _tick - _last_rebalance < REBALANCE_EVERY:
         return []
     targets = _targets(market_state, equity, regime)
     orders = _orders(targets, _positions(portfolio_state), market_state, equity, cash)
