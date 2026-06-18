@@ -1,342 +1,313 @@
-"""CDaR (Conditional Drawdown-at-Risk) allocator.
+"""Omega Calmar — mean-reversion alpha wrapped in a Calmar-first risk shell.
 
-Long-only ETF / mega-cap portfolio that explicitly minimizes recent portfolio
-drawdown -- the denominator of the Calmar ratio -- by solving the CDaR linear
-program (Chekhlov-Uryasev epigraph form) with a projected subgradient, then
-stepping to a defensive book when SPY/QQQ lose their 50-day trend. Every weight
-is capped at 24% and beta-adjusted gross at 1.35x. Pure standard library.
+  1. Market regime switch (SPY/QQQ trend + vol) — ON / SOFT / OFF.
+     Fast to de-risk, slow to re-risk (asymmetric confirmation). The single
+     biggest Calmar lever: don't catch falling knives in a bear tape.
+  2. Self-drawdown governor — scales gross down in bands as our own equity
+     pulls back from its peak, so a bad stretch can't compound into a deep hole.
+  3. Market-vol targeting — gross scales inversely with realized SPY vol, so the
+     book is small exactly when the denominator would otherwise blow out.
+  4. ATR stop-loss exits — cut losers using avg_cost, alongside the existing
+     z-score / RSI take-profit on winners.
+  5. Asymmetric exposure — lever up toward the cap when calm and trending,
+     flatten to cash when not. Maximizes the ratio, not just the numerator.
+
+Long-only, beta-adjusted gross capped at 1.45x. Pure NumPy, no network, no deps.
 """
-from __future__ import annotations
+import numpy as np
 
-import math
-from statistics import mean, pstdev
-from typing import Any
+def _sma(arr, n):
+    if len(arr) < n: return np.mean(arr)
+    return np.mean(arr[-n:])
 
-RISK_CANDIDATES = (
-    "SPY", "QQQ", "DIA", "IWM",
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "XLB",
-    "SMH", "KRE",
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO",
-)
-DEFENSIVE_WEIGHTS = (("XLP", 0.30), ("XLU", 0.30), ("XLV", 0.24), ("XLE", 0.16))
+def _std(arr, n):
+    if len(arr) < n: return np.std(arr) if len(arr) > 1 else 1e-6
+    return np.std(arr[-n:])
 
-BETA_MULTIPLE = {
-    "TQQQ": 3.0, "SOXL": 3.0, "UPRO": 3.0, "SPXL": 3.0, "TNA": 3.0, "FAS": 3.0,
-    "TECL": 3.0, "LABU": 3.0, "CURE": 3.0, "DRN": 3.0, "UDOW": 3.0, "NAIL": 3.0,
-    "QLD": 2.0, "SSO": 2.0, "DDM": 2.0, "ROM": 2.0, "UWM": 2.0, "AGQ": 2.0,
-}
+def _atr(high, low, close, n=14):
+    prev = np.roll(close, 1)
+    prev[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev), np.abs(low - prev)))
+    if len(tr) < n: return np.mean(tr)
+    return np.mean(tr[-n:])
 
-LOOKBACK = 120
-ALPHA = 0.10
-RETURN_TILT = 0.15
-OPT_ITERS = 150
-MAX_WEIGHT = 0.24
-MAX_BETA_GROSS = 1.35
-MIN_TRADE_PCT = 0.015
-DRIFT_LIMIT = 0.27
-REBALANCE_EVERY_DAYS = 5
-RISK_ON_EXPOSURE = 0.95
-VOL_CEILING = 0.40
+def _rsi(close, period=14):
+    if len(close) < period + 1: return 50.0
+    deltas = np.diff(close[-(period + 1):])
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = np.mean(gains)
+    avg_loss = np.mean(losses)
+    if avg_loss < 1e-12: return 100.0
+    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
 
-_last_rebalance_bar_date: str | None = None
-
-
-def closes(bars: list[dict[str, Any]] | None) -> list[float]:
-    if not bars:
-        return []
-    out: list[float] = []
-    for bar in bars:
-        try:
-            c = float(bar["close"])
-        except (KeyError, TypeError, ValueError):
-            return []
-        if c <= 0:
-            return []
-        out.append(c)
-    return out
-
-
-def sma(values: list[float], n: int) -> float | None:
-    return mean(values[-n:]) if len(values) >= n else None
-
-
-def momentum(values: list[float], n: int) -> float | None:
-    if len(values) <= n or values[-(n + 1)] <= 0:
-        return None
-    return values[-1] / values[-(n + 1)] - 1.0
-
-
-def realized_vol(values: list[float], n: int) -> float | None:
-    if len(values) <= n:
-        return None
-    w = values[-(n + 1):]
-    rets = [w[i] / w[i - 1] - 1.0 for i in range(1, len(w)) if w[i - 1] > 0]
-    if len(rets) < 5:
-        return None
-    return pstdev(rets) * math.sqrt(252.0)
-
-
-def _aligned_returns(market_state: dict, tickers: list[str], lookback: int):
-    series: dict[str, list[float]] = {}
-    for t in tickers:
-        cs = closes(market_state.get(t))
-        if len(cs) < lookback + 2:
-            continue
-        w = cs[-(lookback + 1):]
-        rets = [w[i] / w[i - 1] - 1.0 for i in range(1, len(w)) if w[i - 1] > 0]
-        if len(rets) >= lookback - 2:
-            series[t] = rets
-    if not series:
-        return 0, {}
-    T = min(len(r) for r in series.values())
-    return T, {t: r[-T:] for t, r in series.items()}
-
-
-def _project_capped_simplex(w: dict[str, float], cap: float, budget: float) -> dict[str, float]:
-    keys = list(w)
-    lo = min(w.values()) - budget
-    hi = max(w.values())
-    for _ in range(60):
-        mid = (lo + hi) / 2.0
-        s = sum(min(cap, max(0.0, w[k] - mid)) for k in keys)
-        if s > budget:
-            lo = mid
-        else:
-            hi = mid
-    tau = (lo + hi) / 2.0
-    return {k: min(cap, max(0.0, w[k] - tau)) for k in keys}
-
-
-def _cdar_weights(series: dict[str, list[float]], tickers: list[str],
-                  cap: float, budget: float, alpha: float,
-                  lam: float, iters: int) -> dict[str, float]:
-    T = len(series[tickers[0]])
-    n = len(tickers)
-    if n == 1:
-        return {tickers[0]: min(cap, budget)}
-
-    X = {t: [0.0] * (T + 1) for t in tickers}
-    for t in tickers:
-        r = series[t]
-        acc = 0.0
-        for k in range(T):
-            acc += r[k]
-            X[t][k + 1] = acc
-    totals = {t: X[t][T] for t in tickers}
-
-    w = _project_capped_simplex({t: budget / n for t in tickers}, cap, budget)
-    k_tail = max(1, int(math.ceil(alpha * T)))
-    base_eta = 2.0
-    best_w, best_obj = dict(w), None
-
-    for it in range(iters):
-        cum = [0.0] * (T + 1)
-        for k in range(1, T + 1):
-            cum[k] = sum(w[t] * X[t][k] for t in tickers)
-        peak_idx = [0] * (T + 1)
-        best_k = 0
-        for k in range(1, T + 1):
-            if cum[k] >= cum[best_k]:
-                best_k = k
-            peak_idx[k] = best_k
-        dd = [cum[peak_idx[k]] - cum[k] for k in range(T + 1)]
-
-        tail = sorted(range(1, T + 1), key=lambda k: dd[k], reverse=True)[:k_tail]
-        cdar = sum(dd[k] for k in tail) / k_tail
-        obj = cdar - lam * sum(w[t] * totals[t] for t in tickers)
-        if best_obj is None or obj < best_obj:
-            best_obj, best_w = obj, dict(w)
-
-        grad = {t: 0.0 for t in tickers}
-        for k in tail:
-            p = peak_idx[k]
-            for t in tickers:
-                grad[t] += (X[t][p] - X[t][k]) / k_tail
-        for t in tickers:
-            grad[t] -= lam * totals[t]
-
-        eta = base_eta / math.sqrt(it + 1)
-        nxt = {t: w[t] - eta * grad[t] for t in tickers}
-        w = _project_capped_simplex(nxt, cap, budget)
-
-    return best_w
-
-
-def _risk_off_targets(market_state: dict) -> dict[str, float]:
-    avail = [(t, wt) for t, wt in DEFENSIVE_WEIGHTS if closes(market_state.get(t))]
-    if not avail:
-        return {}
-    s = sum(wt for _, wt in avail)
-    return {t: 0.50 * (wt / s) for t, wt in avail}
-
-
-def _scale_caps(weights: dict[str, float]) -> dict[str, float]:
-    capped = {t: min(max(w, 0.0), MAX_WEIGHT) for t, w in weights.items() if w > 0.0}
-    bg = sum(w * BETA_MULTIPLE.get(t, 1.0) for t, w in capped.items())
-    if bg > MAX_BETA_GROSS:
-        s = MAX_BETA_GROSS / bg
-        capped = {t: w * s for t, w in capped.items()}
-    return {t: round(w, 6) for t, w in capped.items() if w > 0.001}
-
-
-def target_weights(market_state: dict) -> dict[str, float]:
-    spy = closes(market_state.get("SPY"))
-    qqq = closes(market_state.get("QQQ"))
-    if len(spy) < 50 or len(qqq) < 50:
-        return {}
-
-    qqq_vol = realized_vol(qqq, 20)
-    risk_on = bool(
-        spy[-1] > (sma(spy, 50) or 1e18)
-        and qqq[-1] > (sma(qqq, 50) or 1e18)
-        and qqq_vol is not None and qqq_vol < VOL_CEILING
-    )
-    if not risk_on:
-        return _scale_caps(_risk_off_targets(market_state))
-
-    candidates = [t for t in RISK_CANDIDATES if closes(market_state.get(t))]
-    T, series = _aligned_returns(market_state, candidates, LOOKBACK)
-    if T < 30 or len(series) < 2:
-        return _scale_caps(_risk_off_targets(market_state))
-
-    pool = sorted(t for t in series if (momentum(closes(market_state[t]), 60) or -1) > 0)
-    if len(pool) < 2:
-        return _scale_caps(_risk_off_targets(market_state))
-    series = {t: series[t] for t in pool}
-
-    raw = _cdar_weights(series, pool, MAX_WEIGHT, RISK_ON_EXPOSURE,
-                        ALPHA, RETURN_TILT, OPT_ITERS)
-    return _scale_caps(raw)
-
-
-def current_positions(portfolio_state: dict) -> dict[str, dict[str, float]]:
-    out: dict[str, dict[str, float]] = {}
-    for raw in portfolio_state.get("positions", []) or []:
-        t = str(raw.get("ticker", "")).upper()
-        if not t:
-            continue
-        try:
-            qty, ac = float(raw.get("quantity", 0.0)), float(raw.get("avg_cost", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if qty <= 0:
-            continue
-        e = out.setdefault(t, {"quantity": 0.0, "avg_cost": ac})
-        e["quantity"] += qty
-        e["avg_cost"] = ac or e["avg_cost"]
-    return out
-
-
-def equity(portfolio_state: dict, cash: float) -> float:
+def _hurst(close, max_lags=10):
+    if len(close) < max_lags * 2: return 0.50
     try:
-        total = float(portfolio_state.get("cash", cash))
-    except (TypeError, ValueError):
-        total = float(cash or 0.0)
-    last = portfolio_state.get("last_prices", {}) or {}
-    for t, pos in current_positions(portfolio_state).items():
-        try:
-            px = float(last.get(t, pos["avg_cost"]))
-        except (TypeError, ValueError):
-            px = pos["avg_cost"]
-        total += pos["quantity"] * max(px, 0.0)
-    return max(total, 0.0)
+        lags = np.arange(2, max_lags)
+        variances = []
+        for lag in lags:
+            diffs = close[lag:] - close[:-lag]
+            s = np.std(diffs)
+            variances.append(s if s > 0 else 1e-6)
+        poly = np.polyfit(np.log(lags), np.log(variances), 1)
+        return float(np.clip(poly[0] * 2.0, 0.0, 1.0))
+    except Exception:
+        return 0.50
 
+def _ann_vol(close, n=20):
+    if len(close) < n + 1: return None
+    rets = np.diff(close[-(n + 1):]) / close[-(n + 1):-1]
+    if len(rets) < 2: return None
+    return float(np.std(rets) * np.sqrt(252))
 
-def _latest_bar_date(market_state: dict) -> str | None:
-    bars = market_state.get("SPY") or market_state.get("QQQ") or []
-    if not bars:
-        return None
-    return str(bars[-1].get("ts", len(bars)))[:10]
+def _ret(close, days):
+    if len(close) < days + 1 or close[-(days + 1)] <= 0: return None
+    return float(close[-1] / close[-(days + 1)] - 1.0)
 
+BETA_3X = {"TQQQ", "SOXL", "UPRO", "SPXL", "TNA", "FAS", "TECL", "LABU", "CURE", "DRN", "UDOW", "NAIL"}
+BETA_2X = {"QLD", "SSO", "DDM", "ROM", "UWM", "AGQ"}
 
-def _days_since_rebalance(market_state: dict) -> int | None:
-    if _last_rebalance_bar_date is None:
-        return None
-    bars = market_state.get("SPY") or market_state.get("QQQ") or []
-    dates = [str(b.get("ts", i))[:10] for i, b in enumerate(bars)]
-    if not dates or _last_rebalance_bar_date not in dates:
-        return None
-    return len(dates) - dates.index(_last_rebalance_bar_date) - 1
+def _beta(t):
+    return 3.0 if t in BETA_3X else 2.0 if t in BETA_2X else 1.0
 
+_regime = "soft"
+_pending = None
+_pending_n = 0
+_peak_equity = 0.0
 
-def _market_prices(market_state: dict) -> dict[str, float]:
-    out = {}
-    for t, bars in market_state.items():
-        cs = closes(bars)
-        if cs:
-            out[t.upper()] = cs[-1]
-    return out
+def _raw_regime(market_state):
+    spy = market_state.get("SPY")
+    qqq = market_state.get("QQQ")
+    if not spy or len(spy) < 60:
+        return "soft"
+    sc = np.array([b["close"] for b in spy], dtype=float)
+    qc = np.array([b["close"] for b in qqq], dtype=float) if qqq and len(qqq) >= 60 else sc
 
+    r3 = _ret(sc, 3)
+    v10 = _ann_vol(sc, 10)
+    if (r3 is not None and r3 < -0.045) or (v10 is not None and v10 > 0.42):
+        return "off"
 
-def _has_drifted(portfolio_state: dict, total_equity: float) -> bool:
-    if total_equity <= 0:
-        return False
-    last = portfolio_state.get("last_prices", {}) or {}
-    for t, pos in current_positions(portfolio_state).items():
-        try:
-            px = float(last.get(t, pos["avg_cost"]))
-        except (TypeError, ValueError):
-            px = pos["avg_cost"]
-        if px > 0 and pos["quantity"] * px / total_equity > DRIFT_LIMIT:
-            return True
-    return False
+    r126 = _ret(sc, 126)
+    v20 = _ann_vol(sc, 20)
+    if r126 is not None and v20 is not None and r126 < -0.10 and v20 > 0.30:
+        return "off"
 
+    sma50 = _sma(sc, 50)
+    sma200 = _sma(sc, 200) if len(sc) >= 200 else None
+    qsma50 = _sma(qc, 50)
+    if v20 is None:
+        return "soft"
 
-def orders_to_rebalance(targets, positions, total_equity, prices, cash_available):
-    if total_equity <= 0:
-        return []
-    min_trade = total_equity * MIN_TRADE_PCT
-    orders, proceeds = [], 0.0
-    for t, pos in positions.items():
-        px = prices.get(t)
-        if not px or px <= 0:
-            continue
-        cur = pos["quantity"] * px
-        tgt = total_equity * targets.get(t, 0.0)
-        if t not in targets:
-            q = int(pos["quantity"])
-            if q > 0 and cur >= min_trade:
-                orders.append({"ticker": t, "side": "sell", "quantity": q})
-                proceeds += q * px
-        elif tgt - cur < -min_trade:
-            q = min(int((cur - tgt) // px), int(pos["quantity"]))
-            if q > 0:
-                orders.append({"ticker": t, "side": "sell", "quantity": q})
-                proceeds += q * px
-    spendable = max(float(cash_available), 0.0) + proceeds * 0.98
-    for t, w in sorted(targets.items()):
-        px = prices.get(t)
-        if not px or px <= 0:
-            continue
-        cur = positions.get(t, {}).get("quantity", 0.0) * px
-        delta = total_equity * w - cur
-        if delta < min_trade:
-            continue
-        q = int(min(delta, spendable) // px)
+    above_long = (sma200 is None) or (sc[-1] > sma200)
+    if sc[-1] > sma50 * 1.003 and qc[-1] > qsma50 * 1.003 and v20 < 0.32 and above_long:
+        return "on"
+    return "soft"
+
+def _confirm(raw):
+    global _regime, _pending, _pending_n
+    if raw == "off":                      
+        _regime, _pending, _pending_n = "off", None, 0
+        return "off"
+    if raw == _regime:
+        _pending, _pending_n = None, 0
+        return _regime
+    need = 1 if (_regime == "off" and raw == "soft") else 2  
+    if raw == _pending:
+        _pending_n += 1
+    else:
+        _pending, _pending_n = raw, 1
+    if _pending_n >= need:
+        _regime, _pending, _pending_n = _pending, None, 0
+    return _regime
+
+def _vol_target_scale(market_state):
+    spy = market_state.get("SPY")
+    if not spy or len(spy) < 21:
+        return 1.0
+    sc = np.array([b["close"] for b in spy], dtype=float)
+    v = _ann_vol(sc, 20)
+    if not v or v <= 0:
+        return 1.0
+    return float(np.clip(0.16 / v, 0.35, 1.0))   
+
+def _dd_scale(equity):
+    global _peak_equity
+    _peak_equity = max(_peak_equity, equity)
+    if _peak_equity <= 0:
+        return 1.0
+    dd = 1.0 - equity / _peak_equity
+    if dd >= 0.10: return 0.25
+    if dd >= 0.06: return 0.50
+    if dd >= 0.035: return 0.75
+    return 1.0
+
+def _reversion_score(bars):
+    n = len(bars)
+    if n < 30: return None
+    close = np.array([b["close"] for b in bars], dtype=float)
+    high = np.array([b["high"] for b in bars], dtype=float)
+    low = np.array([b["low"] for b in bars], dtype=float)
+    price = close[-1]
+    if price <= 0: return None
+
+    mean_20 = _sma(close, 20)
+    std_20 = _std(close, 20)
+    if std_20 < 1e-6: return None
+    z_score = (price - mean_20) / std_20
+    rsi = _rsi(close)
+    lower_bb = mean_20 - 2.0 * std_20
+    bb_dist = (price - lower_bb) / std_20
+    hurst = _hurst(close[-30:])
+    atr = _atr(high, low, close, 14)
+    atr_pct = atr / price
+
+    if n >= 100:
+        sma100 = _sma(close, 100)
+        if price < sma100 * 0.88: return None
+    if n >= 50:
+        sma50 = _sma(close, 50)
+        if price < sma50 * 0.80: return None    
+
+    is_oversold = (z_score < -0.7 or rsi < 38 or bb_dist < 0.3)
+    if not is_oversold: return None
+
+    score = 0.0
+    score += max(0, -z_score) * 15.0
+    score += max(0, (40.0 - rsi)) * 1.0
+    score += max(0, -bb_dist) * 8.0
+    if hurst < 0.45: score += (0.45 - hurst) * 30.0
+    if hurst > 0.55: score *= 0.5
+    if n > 3 and close[-1] / close[-2] - 1 > 0: score += 3.0   
+    return {"score": score, "atr_pct": atr_pct, "price": price,
+            "z_score": z_score, "rsi": rsi, "hurst": hurst}
+
+def _quality_score(bars):
+    n = len(bars)
+    if n < 50: return None
+    close = np.array([b["close"] for b in bars], dtype=float)
+    high = np.array([b["high"] for b in bars], dtype=float)
+    low = np.array([b["low"] for b in bars], dtype=float)
+    price = close[-1]
+    if price <= 0: return None
+    atr = _atr(high, low, close, 14)
+    atr_pct = atr / price
+    vol = atr_pct * np.sqrt(252)
+    if vol > 0.30: return None
+    ret_20 = close[-1] / close[-20] - 1 if n >= 20 else 0
+    if ret_20 < 0: return None
+    rsi = _rsi(close)
+    if rsi > 70: return None
+    score = (1.0 / (vol + 0.05)) + ret_20 * 10
+    return {"score": score, "atr_pct": atr_pct, "price": price,
+            "z_score": 0, "rsi": rsi, "hurst": 0.50}
+
+MAX_POSITIONS = 12
+MAX_PER_NAME = 0.18          
+GROSS_ON = 1.45            
+GROSS_SOFT = 0.60
+GROSS_OFF = 0.0
+TARGET_RISK = 0.045
+STOP_ATR_MULT = 2.5         
+
+def _positions_map(portfolio_state):
+    positions = {}
+    for t, v in portfolio_state.items():
+        if t in ("cash", "last_prices", "positions"): continue
+        qty = v.get("quantity", v.get("qty", 0)) if isinstance(v, dict) else v
+        if qty and float(qty) > 0: positions[t] = {"qty": float(qty), "avg_cost": 0.0}
+    for pos in portfolio_state.get("positions", []) or []:
+        t = str(pos.get("ticker", "")).upper()
+        q = float(pos.get("quantity", 0))
         if q > 0:
-            orders.append({"ticker": t, "side": "buy", "quantity": q})
-            spendable -= q * px
-    return orders[:45]
+            positions[t] = {"qty": q, "avg_cost": float(pos.get("avg_cost", 0.0))}
+    return positions
 
+def decide(market_state, portfolio_state, cash):
+    orders = []
+    cash = float(cash)
+    positions = _positions_map(portfolio_state)
 
-def decide(market_state: dict, portfolio_state: dict, cash: float) -> list[dict]:
-    global _last_rebalance_bar_date
-    if not market_state:
-        return []
-    latest = _latest_bar_date(market_state)
-    if latest is None:
-        return []
-    total_equity = equity(portfolio_state, cash)
-    days = _days_since_rebalance(market_state)
-    should = (_last_rebalance_bar_date is None or days is None
-              or days >= REBALANCE_EVERY_DAYS or _has_drifted(portfolio_state, total_equity))
-    if not should:
-        return []
-    targets = target_weights(market_state)
-    if not targets:
-        return []
-    orders = orders_to_rebalance(targets, current_positions(portfolio_state),
-                                 total_equity, _market_prices(market_state), cash)
-    if orders:
-        _last_rebalance_bar_date = latest
+    prices = {}
+    for t, bars in market_state.items():
+        if bars: prices[t] = bars[-1]["close"]
+
+    equity = cash
+    for t, p in positions.items():
+        if t in prices: equity += p["qty"] * prices[t]
+    if equity <= 0: return orders
+
+    regime = _confirm(_raw_regime(market_state))
+    dd_scale = _dd_scale(equity)
+    vt_scale = _vol_target_scale(market_state)
+
+    if regime == "off":
+        gross_cap = GROSS_OFF
+    elif regime == "soft":
+        gross_cap = GROSS_SOFT * dd_scale * vt_scale
+    else:
+        gross_cap = GROSS_ON * dd_scale * vt_scale
+
+    for ticker, p in list(positions.items()):
+        bars = market_state.get(ticker, [])
+        if len(bars) < 20:
+            if regime == "off":
+                orders.append({"ticker": ticker, "side": "sell", "quantity": int(p["qty"])})
+            continue
+        close = np.array([b["close"] for b in bars], dtype=float)
+        high = np.array([b["high"] for b in bars], dtype=float)
+        low = np.array([b["low"] for b in bars], dtype=float)
+        price = close[-1]
+        mean_20 = _sma(close, 20)
+        std_20 = _std(close, 20)
+        z = (price - mean_20) / std_20 if std_20 > 1e-6 else 0
+        rsi = _rsi(close)
+        atr = _atr(high, low, close, 14)
+
+        take_profit = z > 0.8 or rsi > 65
+        stop_loss = p["avg_cost"] > 0 and price < p["avg_cost"] - STOP_ATR_MULT * atr
+        if regime == "off" or take_profit or stop_loss:
+            orders.append({"ticker": ticker, "side": "sell", "quantity": int(p["qty"])})
+
+    if gross_cap <= 0:
+        return orders
+
+    held = set(positions)
+    candidates = []
+    for ticker, bars in market_state.items():
+        if ticker in held: continue
+        res = _reversion_score(bars)
+        if res is not None:
+            res["ticker"] = ticker
+            candidates.append(res)
+    if len(candidates) < 3:
+        for ticker, bars in market_state.items():
+            if ticker in held: continue
+            res = _quality_score(bars)
+            if res is not None:
+                res["ticker"] = ticker
+                candidates.append(res)
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    slots = MAX_POSITIONS - len(positions)
+    selected = candidates[:max(slots, 0)]
+
+    exposure = sum(p["qty"] * prices[t] * _beta(t) for t, p in positions.items() if t in prices)
+    target_exposure = equity * gross_cap
+
+    for c in selected:
+        room = target_exposure - exposure
+        if room <= 0: break
+        t = c["ticker"]
+        stock_vol = c["atr_pct"] * np.sqrt(252)
+        if stock_vol < 0.05: stock_vol = 0.15
+        allocation = (TARGET_RISK / stock_vol) * equity
+        allocation = min(allocation, equity * MAX_PER_NAME, room / _beta(t), cash * 0.45)
+        qty = int(allocation / c["price"])
+        if qty > 0:
+            orders.append({"ticker": t, "side": "buy", "quantity": qty})
+            cash -= qty * c["price"]
+            exposure += qty * c["price"] * _beta(t)
+
     return orders
