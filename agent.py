@@ -1,4 +1,4 @@
-    """IGNITION — explosive-leader bot with dip-entry, vol budget, and a parachute.
+"""IGNITION — explosive-leader bot with dip-entry, vol budget, and a parachute.
 
 Thesis (what the brief actually rewards, done as a quant would):
   Ride the genuinely explosive names, but never *chase* them. Buy leaders on a
